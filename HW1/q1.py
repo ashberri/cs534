@@ -1,3 +1,7 @@
+import argparse
+import json
+from pathlib import Path
+
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -274,14 +278,77 @@ def graph_correlations(DF):
     plt.show()
 
 
-def main():
+SAVED_RESULTS_PATH = Path(__file__).resolve().with_name("saved_coef.txt")
+
+
+def save_results(path, results, standardized_results, unstandardized_results,
+                 standardized_coefs, gammas, feature_cols, station_categories,
+                 train_mean, train_std):
+    """Save report/plot inputs and preprocessing metadata, without the datasets."""
+    best_idx = standardized_results["test-rmse"].idxmin()
+    best_std = standardized_results.loc[best_idx]
+    best_unstd = unstandardized_results.loc[unstandardized_results["test-rmse"].idxmin()]
+    best_coefs = standardized_coefs[best_idx]
+    top_idx = np.argsort(np.abs(best_coefs))[-3:][::-1]
+    saved = {
+        "format_version": 1,
+        "linear_results": results,
+        "standardized_results": standardized_results.to_dict(orient="records"),
+        "unstandardized_results": unstandardized_results.to_dict(orient="records"),
+        "standardized_coefs": standardized_coefs.tolist(),
+        "gammas": gammas.tolist(),
+        "feature_cols": feature_cols,
+        "preprocessing": {
+            "station_categories": station_categories,
+            "train_mean": train_mean.tolist(),
+            "train_std": train_std.tolist(),
+            "use_weekend": False,
+        },
+        "best_standardized": best_std.to_dict(),
+        "best_unstandardized": best_unstd.to_dict(),
+        "comparison": {
+            "test-rmse_difference": float(best_std["test-rmse"] - best_unstd["test-rmse"]),
+            "test-r2_difference": float(best_std["test-r2"] - best_unstd["test-r2"]),
+        },
+        "top_features": [
+            {"feature": feature_cols[j], "coefficient": float(best_coefs[j])}
+            for j in top_idx
+        ],
+    }
+    # Serialize before opening the destination, so invalid numbers don't erase it.
+    serialized = json.dumps(saved, indent=2, allow_nan=False)
+    Path(path).write_text(serialized + "\n", encoding="utf-8")
+
+
+def load_results(path=SAVED_RESULTS_PATH):
+    """Restore the arrays and tables needed to reproduce the printed report/plot."""
+    with Path(path).open(encoding="utf-8") as file:
+        saved = json.load(file)
+    if saved.get("format_version") != 1:
+        raise ValueError("Unsupported saved results format")
+    return (
+        saved["linear_results"],
+        pd.DataFrame(saved["standardized_results"]),
+        pd.DataFrame(saved["unstandardized_results"]),
+        np.asarray(saved["standardized_coefs"], dtype=float),
+        np.asarray(saved["gammas"], dtype=float),
+        saved["feature_cols"],
+    )
+
+
+def main(load=False, saved_path=SAVED_RESULTS_PATH):
     """Example driver showing how to read the CitiBike CSVs, engineer
     features, and evaluate a model. This is a starting point for all the
     written analysis part of the problem. You can extend it in main or
     use a different file to call the functions.
 
-    Assumes the data sits in the current working directory.
+    Assumes the data sits in the current working directory. With load=True,
+    reproduce the saved report and plot without reading data or fitting models.
     """
+    if load:
+        report_results(*load_results(saved_path))
+        return
+
     train_df = pd.read_csv("citibike_2022_train_processed.csv", low_memory=False)
     test_df = pd.read_csv("citibike_2023_test_processed.csv", low_memory=False)
 
@@ -305,44 +372,7 @@ def main():
     # TODO: Do all of the written parts of the problem below.
 
     # Q1d. run eval_linear here
-    print("printing linear regression results. Q1d")
     results = eval_linear(train_x_std, train_y, test_x_std, test_y)
-    for metric, value in results.items():
-        print(f"{metric}: {value:.4f}")
-
-    # Q1e. run ridge here
-    print("printing ridge results. Q1e &f")
-    gammas = np.logspace(-4, 10, 20)
-    standardized_results, standardized_coefs = ridge_sweep(
-        train_x_std, train_y, test_x_std, test_y,
-        gammas,
-        save_coefs=True
-    ) #saved for Q1f
-    original_results = ridge_sweep(
-        train_x, train_y, test_x, test_y,
-        gammas
-    )
-    best_std = print_ridge_results("Standardized", standardized_results)
-    best_original = print_ridge_results("Unstandardized", original_results)
-
-    print("\nQ1e: Comparison of the best models on the tested grid")
-    changed = best_std["gamma"] != best_original["gamma"]
-    print(f"Does standardization change the selected gamma? {'Yes' if changed else 'No'}")
-    rmse_difference = best_std["test-rmse"] - best_original["test-rmse"]
-    r2_difference = best_std["test-r2"] - best_original["test-r2"]
-    print(f"Test RMSE difference (standardized - unstandardized): {rmse_difference:+.6f}")
-    print(f"Test R^2 difference (standardized - unstandardized): {r2_difference:+.6f}")
-    if rmse_difference < 0:
-        print("Standardization improves the best test performance on this grid.")
-    elif rmse_difference > 0:
-        print("Standardization worsens the best test performance on this grid.")
-    else:
-        print("The best test performance is equal on this grid.")
-    print("Lower RMSE and higher R^2 are better; both select the same minimum-error model.\n")
-
-
-    # Q1f
-    print("\nQ1f: Ridge regression")
 
     # 20 log-spaced gamma values from 10^-4 to 10^10
     gammas = np.logspace(-4, 10, 20)
@@ -367,39 +397,121 @@ def main():
         test_y,
         gammas
     )
+    train_mean = np.mean(train_x, axis=0)
+    train_std = np.std(train_x, axis=0)
+    train_std = np.where(train_std == 0, 1.0, train_std)
+    save_results(
+        saved_path, results, standardized_results, unstandardized_results,
+        standardized_coefs, gammas, feature_cols, station_categories,
+        train_mean, train_std,
+    )
+    report_results(
+        results, standardized_results, unstandardized_results,
+        standardized_coefs, gammas, feature_cols,
+    )
 
+
+def report_results(results, standardized_results, unstandardized_results,
+                   standardized_coefs, gammas, feature_cols):
+    """Print all metrics and draw Q1h using only saved results, with no fitting."""
+    print("printing linear regression results. Q1d")
+    for metric, value in results.items():
+        print(f"{metric}: {value:.4f}")
+    print("\nQ1e, f: Ridge regression")
     best_std = print_ridge_results(
         "Standardized",
         standardized_results
     )
-
     best_unstd = print_ridge_results(
         "Unstandardized",
         unstandardized_results
     )
-
     print("\nComparison")
-
     print(
         f"Best standardized gamma: "
         f"{best_std['gamma']:.8e}"
     )
-
     print(
         f"Best unstandardized gamma: "
         f"{best_unstd['gamma']:.8e}"
     )
-
     print(
         f"Test RMSE difference (standardized - unstandardized): "
         f"{best_std['test-rmse'] - best_unstd['test-rmse']:+.6f}"
     )
-
     print(
         f"Test R^2 difference (standardized - unstandardized): "
         f"{best_std['test-r2'] - best_unstd['test-r2']:+.6f}"
     )
 
+    # Q1h: ridge coefficient path
+    print("\nQ1h: Ridge coefficient path")
+
+    # Find the gamma selected in Q1f
+    best_idx = standardized_results["test-rmse"].idxmin()
+    best_gamma = standardized_results.loc[best_idx, "gamma"]
+
+    # Coefficients at the selected gamma
+    best_coefs = standardized_coefs[best_idx]
+
+    # Find the 3 largest coefficients in absolute value at the selected gamma
+    top_idx = np.argsort(np.abs(best_coefs))[-3:][::-1]
+
+    print("Top 3 features at selected gamma:")
+    for j in top_idx:
+        print(
+            f"{feature_cols[j]}: "
+            f"coefficient = {best_coefs[j]:.6f}"
+        )
+
+    # Plot every coefficient path
+    plt.figure(figsize=(12, 8))
+
+    for j in range(len(feature_cols)):
+        plt.plot(
+            gammas,
+            standardized_coefs[:, j],
+            linewidth=0.7,
+            alpha=0.25
+        )
+
+    # Plot the top 3 again so they are easy to see
+    for j in top_idx:
+        plt.plot(
+            gammas,
+            standardized_coefs[:, j],
+            linewidth=2,
+            label=feature_cols[j]
+        )
+
+    # Mark the gamma selected in Q1f
+    plt.axvline(
+        best_gamma,
+        linestyle="--",
+        linewidth=2,
+        label=f"Selected gamma = {best_gamma:.2e}"
+    )
+
+    plt.xscale("log")
+    plt.xlabel("Gamma")
+    plt.ylabel("Ridge coefficient")
+    plt.title("Ridge Coefficient Paths (Standardized Data)")
+    plt.legend()
+    plt.tight_layout()
+
+    plt.savefig(
+        "q1h_ridge_coefficient_path.png",
+        dpi=300,
+        bbox_inches="tight"
+    )
+
+    plt.show()
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Fit and save Q1 results, or replay saved results.")
+    parser.add_argument(
+        "--load", action="store_true",
+        help="Read saved_coef.txt beside q1.py without reading CSVs or fitting models.",
+    )
+    args = parser.parse_args()
+    main(load=args.load)
