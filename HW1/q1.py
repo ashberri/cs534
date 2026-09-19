@@ -1,3 +1,10 @@
+"""
+to run the 20*2 times ridge regression just python q1.py
+to load the saved run results without rerunning: python q1.py --load
+to run the comparison between augmented ols and ridge, run: python q1.py --load --q2b
+or to simply see if they are comparison run: python q1.py --compare-coefs
+"""
+
 import argparse
 import json
 from pathlib import Path
@@ -352,7 +359,7 @@ def load_results(path=SAVED_RESULTS_PATH):
     )
 
 
-def main(load=False, saved_path=SAVED_RESULTS_PATH, q2b=False):
+def main(load=False, saved_path=SAVED_RESULTS_PATH, q2b=False, compare_coefs=False):
     """Example driver showing how to read the CitiBike CSVs, engineer
     features, and evaluate a model. This is a starting point for all the
     written analysis part of the problem. You can extend it in main or
@@ -366,6 +373,34 @@ def main(load=False, saved_path=SAVED_RESULTS_PATH, q2b=False):
 
     def progress(message):
         print(f"[elapsed {perf_counter() - started:.1f}s] {message}", flush=True)
+
+    if compare_coefs:
+        # Compare the saved vectors directly, without fitting either model again.
+        with Path(saved_path).open(encoding="utf-8") as file:
+            ridge_saved = json.load(file)
+        with Path(saved_path).with_name("q2b_comparison.json").open(encoding="utf-8") as file:
+            ols_saved = json.load(file)
+
+        gammas = np.asarray(ridge_saved["gammas"], dtype=float)
+        indices = np.flatnonzero(np.isclose(gammas, ols_saved["gamma"], rtol=1e-12, atol=0))
+        if len(indices) != 1:
+            raise ValueError("Expected exactly one saved ridge model matching the Q2b gamma")
+        ridge_coefs = np.asarray(ridge_saved["standardized_coefs"][indices[0]], dtype=float)
+        ols_coefs = np.asarray(ols_saved["ols_coefs"], dtype=float)
+        if ridge_coefs.shape != ols_coefs.shape:
+            raise ValueError("Saved ridge and OLS coefficient vectors have different shapes")
+
+        # Rank features by ridge coefficient magnitude, keeping signed values.
+        top_idx = np.argsort(np.abs(ridge_coefs))[-10:][::-1]
+        comparison = pd.DataFrame({
+            "feature": [ridge_saved["feature_cols"][j] for j in top_idx],
+            "ridge": ridge_coefs[top_idx],
+            "augmented_ols": ols_coefs[top_idx],
+        })
+        print(comparison.to_string(index=False, float_format="{:.6f}".format))
+        coefficients_match = np.allclose(ols_coefs, ridge_coefs, rtol=1e-5, atol=1e-7)
+        print(f"coefficients match = {str(coefficients_match).lower()}")
+        return
 
     if load:
         progress(f"Loading saved results from {Path(saved_path).resolve()}")
@@ -669,5 +704,9 @@ if __name__ == "__main__":
         "--q2b", action="store_true",
         help="Also read the original CSVs and fit augmented OLS for Q2b using saved ridge coefficients.",
     )
+    parser.add_argument(
+        "--compare-coefs", action="store_true",
+        help="Compare saved Q2b OLS and ridge coefficients only, without fitting models.",
+    )
     args = parser.parse_args()
-    main(load=args.load, q2b=args.q2b)
+    main(load=args.load, q2b=args.q2b, compare_coefs=args.compare_coefs)
