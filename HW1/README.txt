@@ -13,3 +13,5 @@ For 1e I used codex to write this ridge_sweep which has the different gamma test
 created the json files to hold stats and coefficieints etc so i don't have to rerun stuff for later questions.
 
 I used help from chatgpt for hints on 2a. 
+
+Used help from codex to complete the train function for 3c.
