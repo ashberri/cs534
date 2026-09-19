@@ -30,7 +30,7 @@ def standardize_data(trainx, testx):
     return (trainx - mean) / std, (testx - mean) / std
 
 
-def eval_linear(trainx, trainy, testx, testy):
+def eval_linear(trainx, trainy, testx, testy, *, fit_intercept=True, return_model=False):
     """Fits an (unregularized) linear regression model on the training data
     and evaluates it on both the training and test data.
 
@@ -39,21 +39,25 @@ def eval_linear(trainx, trainy, testx, testy):
         trainy: (n_train,) ndarray of training targets.
         testx: (n_test, p) ndarray of test features.
         testy: (n_test,) ndarray of test targets.
+        fit_intercept: Whether to fit an intercept; False for centered Q2b augmentation.
+        return_model: If True, return (metrics, fitted_model) to inspect coefficients.
 
     Returns:
         dict with keys "train-rmse", "train-r2", "test-rmse", "test-r2"
         mapping to the corresponding scalar performance metrics.
     """
-    model = LinearRegression()
+    # Q2b uses centered targets and must not recenter the augmented design.
+    model = LinearRegression(fit_intercept=fit_intercept)
     model.fit(trainx, trainy)
     train_pred = model.predict(trainx)
     test_pred = model.predict(testx)
-    return {
+    metrics = {
         "train-rmse": float(np.sqrt(mean_squared_error(trainy, train_pred))),
         "train-r2": float(r2_score(trainy, train_pred)),
         "test-rmse": float(np.sqrt(mean_squared_error(testy, test_pred))),
         "test-r2": float(r2_score(testy, test_pred)),
     }
+    return (metrics, model) if return_model else metrics
 
 
 def eval_ridge(trainx, trainy, testx, testy, gamma):
@@ -348,7 +352,7 @@ def load_results(path=SAVED_RESULTS_PATH):
     )
 
 
-def main(load=False, saved_path=SAVED_RESULTS_PATH):
+def main(load=False, saved_path=SAVED_RESULTS_PATH, q2b=False):
     """Example driver showing how to read the CitiBike CSVs, engineer
     features, and evaluate a model. This is a starting point for all the
     written analysis part of the problem. You can extend it in main or
@@ -356,6 +360,7 @@ def main(load=False, saved_path=SAVED_RESULTS_PATH):
 
     Assumes the data sits in the current working directory. With load=True,
     reproduce the saved report and plot without reading data or fitting models.
+    Adding q2b=True reads the CSVs and fits augmented OLS using saved ridge results.
     """
     started = perf_counter()
 
@@ -367,6 +372,8 @@ def main(load=False, saved_path=SAVED_RESULTS_PATH):
         saved = load_results(saved_path)
         progress("Saved results loaded; printing report and plotting")
         report_results(*saved, progress=progress)
+        if q2b:
+            run_q2b(saved_path, progress=progress)
         progress("Finished")
         return
 
@@ -452,8 +459,91 @@ def main(load=False, saved_path=SAVED_RESULTS_PATH):
         results, standardized_results, unstandardized_results,
         standardized_coefs, gammas, feature_cols, progress=progress,
     )
+    if q2b:
+        run_q2b(saved_path, progress=progress)
     progress("Finished")
 
+
+def compare_augmented_ols(trainx, trainy, testx, testy, gamma, ridge_coefs):
+    """Compare ridge with OLS on [X; sqrt(gamma) I], [y - mean(y); 0]."""
+    p = trainx.shape[1]
+    target_mean = trainy.mean()
+    augmented_x = np.vstack((trainx, np.sqrt(gamma) * np.eye(p)))
+    augmented_y = np.concatenate((trainy - target_mean, np.zeros(p)))
+    metrics, model = eval_linear(
+        augmented_x, augmented_y, testx, testy - target_mean,
+        fit_intercept=False, return_model=True,
+    )
+    difference = model.coef_ - ridge_coefs
+    return {
+        "gamma": float(gamma),
+        "target_mean": float(target_mean),
+        "augmented_shape": list(augmented_x.shape),
+        "augmented_metrics": metrics,
+        "ols_coefs": model.coef_.tolist(),
+        "max_absolute_difference": float(np.max(np.abs(difference))),
+        "l2_difference": float(np.linalg.norm(difference)),
+        "coefficients_match": bool(np.allclose(model.coef_, ridge_coefs, rtol=1e-5, atol=1e-7)),
+    }
+
+
+def run_q2b(saved_path=SAVED_RESULTS_PATH, progress=print):
+    """Rebuild standardized data using saved metadata; fit only augmented OLS."""
+    progress("Q2b: loading saved ridge coefficients and preprocessing statistics")
+    with Path(saved_path).open(encoding="utf-8") as file:
+        saved = json.load(file)
+    metadata = saved["preprocessing"]
+    features = saved["feature_cols"]
+    best_idx = int(np.argmin([row["test-rmse"] for row in saved["standardized_results"]]))
+    gamma = saved["standardized_results"][best_idx]["gamma"]
+    ridge_coefs = np.asarray(saved["standardized_coefs"][best_idx])
+
+    def read_data(filename):
+        progress(f"Q2b: reading and encoding {filename}")
+        frame = preprocess_features(
+            pd.read_csv(filename, low_memory=False),
+            use_weekend=metadata["use_weekend"],
+            station_categories=metadata["station_categories"],
+        )
+        x = frame[features].to_numpy(dtype=float)
+        x -= np.asarray(metadata["train_mean"])
+        x /= np.asarray(metadata["train_std"])
+        return x, frame["duration_min"].to_numpy(dtype=float)
+
+    trainx, trainy = read_data("citibike_2022_train_processed.csv")
+    testx, testy = read_data("citibike_2023_test_processed.csv")
+    progress(
+        f"Q2b: constructing augmented matrix {trainx.shape[0] + trainx.shape[1]:,} "
+        f"x {trainx.shape[1]:,} and fitting OLS with gamma={gamma:.8e} "
+        "(updates resume when fitting finishes)"
+    )
+    comparison = compare_augmented_ols(trainx, trainy, testx, testy, gamma, ridge_coefs)
+    print("\nQ2b: Augmented OLS versus saved standardized ridge")
+    print(f"Selected gamma: {gamma:.8e}")
+    print(f"Maximum absolute coefficient difference: {comparison['max_absolute_difference']:.8e}")
+    print(f"L2 coefficient difference: {comparison['l2_difference']:.8e}")
+    print(f"Coefficients match (rtol=1e-5, atol=1e-7): {comparison['coefficients_match']}")
+    for metric, value in comparison["augmented_metrics"].items():
+        print(f"Augmented OLS {metric}: {value:.6f}")
+    print("Training metrics above include the artificial penalty rows.")
+    print(
+        "The augmented squared loss is ||Xw - (y - mean(y))||^2 + gamma*||w||^2. "
+        "With standardized training X and fit_intercept=False, this has the same "
+        "coefficient solution as ridge with an unpenalized intercept. "
+        "The training target mean is the intercept on the original response scale."
+    )
+    if comparison["coefficients_match"]:
+        print("The numerical agreement confirms the augmented least-squares derivation.")
+    else:
+        print(
+            "This run does not confirm numerical agreement at the stated tolerance. "
+            "Check that the CSVs are unchanged from the saved ridge run and inspect "
+            "numerical conditioning; the algebraic identity still holds."
+        )
+    output = Path(saved_path).with_name("q2b_comparison.json")
+    output.write_text(json.dumps(comparison, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+    progress(f"Q2b comparison saved to {output.resolve()}")
+    return comparison
 
 def report_results(results, standardized_results, unstandardized_results,
                    standardized_coefs, gammas, feature_cols, progress=None):
@@ -513,13 +603,24 @@ def report_results(results, standardized_results, unstandardized_results,
         progress(f"Drawing coefficient paths for {len(feature_cols):,} features")
     plt.figure(figsize=(12, 8))
 
+    legend_idx = np.argsort(np.abs(best_coefs))[-8:][::-1]
     for j in range(len(feature_cols)):
+        if j in legend_idx:
+            continue
         plt.plot(
             gammas,
             standardized_coefs[:, j],
-            linewidth=2 if j in top_idx else 0.7,
-            alpha=1.0 if j in top_idx else 0.4,
-            label=feature_cols[j]
+            color="gray",
+            linewidth=0.7,
+            alpha=0.25,
+        )
+    # Draw highlighted paths last, with legend entries ordered by magnitude.
+    for j in legend_idx:
+        plt.plot(
+            gammas,
+            standardized_coefs[:, j],
+            linewidth=2,
+            label=feature_cols[j],
         )
 
     # Mark the gamma selected in Q1f
@@ -534,36 +635,39 @@ def report_results(results, standardized_results, unstandardized_results,
     plt.xlabel("Gamma")
     plt.ylabel("Ridge coefficient")
     plt.title("Ridge Coefficient Paths (Standardized Data)")
-    plt.tight_layout()
-    # Include every feature once. Keep the potentially large legend outside
-    # the axes; bbox_inches="tight" includes the entire legend in the output.
-    legend_columns = min(8, max(1, int(np.ceil((len(feature_cols) + 1) / 35))))
     plt.legend(
-        loc="upper left",
-        bbox_to_anchor=(1.02, 1),
-        ncol=legend_columns,
-        fontsize=6,
-        title="All features (top 3 paths emphasized)",
+        loc="upper right",
+        fontsize=9,
+        title="Top 8 features at selected gamma",
+        framealpha=1.0,
     )
+    plt.tight_layout()
 
     if progress:
         progress("Saving q1h_ridge_coefficient_path.png")
     plt.savefig(
         "q1h_ridge_coefficient_path.png",
-        # Thousands of legend entries produce a large image even at 100 dpi.
-        dpi=100 if len(feature_cols) > 200 else 300,
+        dpi=300,
         bbox_inches="tight"
     )
 
     if progress:
         progress("Plot saved; opening plot (if a window appears, close it to finish)")
-    plt.show()
+    # plt.show()
+
+    # 2b is implemented below; enable with --load --q2b.
+
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Fit and save Q1 results, or replay saved results.")
     parser.add_argument(
         "--load", action="store_true",
-        help="Read saved_coef.txt beside q1.py without reading CSVs or fitting models.",
+        help="Replay saved Q1 results without fitting; --q2b additionally reads CSVs and fits OLS.",
+    )
+    parser.add_argument(
+        "--q2b", action="store_true",
+        help="Also read the original CSVs and fit augmented OLS for Q2b using saved ridge coefficients.",
     )
     args = parser.parse_args()
-    main(load=args.load)
+    main(load=args.load, q2b=args.q2b)
